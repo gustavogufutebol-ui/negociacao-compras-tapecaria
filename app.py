@@ -4,12 +4,10 @@ import pdfplumber
 import re
 import math
 import traceback
-import plotly.express as px
 from io import BytesIO
 from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font, Border, Side, Alignment
 from openpyxl.utils import get_column_letter
-from openpyxl.formatting.rule import FormulaRule
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
 st.set_page_config(page_title="Portal Compras - Tapeçaria", layout="wide")
@@ -62,12 +60,11 @@ def extrair_dados_pdf_web(file):
                 # Identificação dos Meses no Cabeçalho da Tabela
                 if "CÓDIGO" in l_str.upper() and "DESCRIÇÃO" in l_str.upper():
                     partes_h = l_str.split()
-                    # Tenta capturar as colunas de meses (geralmente entre DESCRICAO/EMB e MEDIA)
                     cand_meses = [p for p in partes_h if len(p) == 3 and p.isalpha()]
                     if len(cand_meses) >= 4 and not meses_cabecalho:
                         meses_cabecalho = [m.upper() for m in cand_meses[:4]]
 
-                # Limpeza de asteriscos no início do código
+                # Limpeza de asteriscos no início do código (ex: ***16759)
                 l_limpa = re.sub(r'^\*+\s*', '', l_str)
 
                 # Busca por código numérico válido de produto (3 a 6 dígitos)
@@ -102,9 +99,7 @@ def extrair_dados_pdf_web(file):
                             continue
 
     df_res = pd.DataFrame(dados)
-    if meses_cabecalho and len(meses_cabecalho) < 4:
-        meses_cabecalho = ["MÊS 1", "MÊS 2", "MÊS 3", "MÊS 4"]
-    elif not meses_cabecalho:
+    if not meses_cabecalho or len(meses_cabecalho) < 4:
         meses_cabecalho = ["MÊS 1", "MÊS 2", "MÊS 3", "MÊS 4"]
 
     return df_res, meses_cabecalho
@@ -161,189 +156,190 @@ st.markdown("<br>", unsafe_allow_html=True)
 # === PROCESSAMENTO AUTOMÁTICO ("PISCOU, MUDOU") ===
 # ====================================================
 if uploaded_files:
-    dfs_por_filial = {}
-    todos_dados = []
-    meses_globais = []
+    with st.spinner("🔍 Processando arquivos PDF e calculando regras de estoque..."):
+        dfs_por_filial = {}
+        todos_dados = []
+        meses_globais = []
 
-    for f in uploaded_files:
-        df, meses = extrair_dados_pdf_web(f)
-        if not df.empty:
-            dfs_por_filial[f.name.replace(".pdf", "").upper()] = df
-            todos_dados.append(df)
-            if len(meses) >= 4 and not meses_globais:
-                meses_globais = meses[:4]
+        for f in uploaded_files:
+            df, meses = extrair_dados_pdf_web(f)
+            if not df.empty:
+                dfs_por_filial[f.name.replace(".pdf", "").upper()] = df
+                todos_dados.append(df)
+                if len(meses) >= 4 and not meses_globais:
+                    meses_globais = meses[:4]
 
-    if not meses_globais:
-        meses_globais = ["MÊS 1", "MÊS 2", "MÊS 3", "MÊS 4"]
+        if not meses_globais:
+            meses_globais = ["MÊS 1", "MÊS 2", "MÊS 3", "MÊS 4"]
 
-    if not todos_dados:
-        st.error("⚠️ O sistema não encontrou produtos compatíveis nos PDFs.")
-    else:
-        try:
-            df_global = pd.concat(todos_dados).reset_index(drop=True)
-            df_global['ESTOQUE_DISPONIVEL'] = df_global['ESTOQUE']
+        if not todos_dados:
+            st.error("⚠️ O sistema não encontrou produtos compatíveis nos PDFs.")
+        else:
+            try:
+                df_global = pd.concat(todos_dados).reset_index(drop=True)
+                df_global['ESTOQUE_DISPONIVEL'] = df_global['ESTOQUE']
 
-            vendas_recentes = df_global['MES_1'] + df_global['MES_2'] + df_global['MES_3'] + df_global['MES_4']
-            df_global['TOTAL_VENDAS_RECENTES'] = vendas_recentes
+                vendas_recentes = df_global['MES_1'] + df_global['MES_2'] + df_global['MES_3'] + df_global['MES_4']
+                df_global['TOTAL_VENDAS_RECENTES'] = vendas_recentes
 
-            # Rastreador de excedentes para cálculo de transferências
-            tracker_estoque = {}
-            for _, row in df_global.iterrows():
-                f_nome = row['FILIAL_NOME']
-                c = row['CODIGO']
-                est = float(row['ESTOQUE'])
-                med = float(row['MEDIA_SISTEMA'])
-                excesso = est if med == 0 else max(0.0, est - (med * meta))
-                tracker_estoque[(f_nome, c)] = {'EXCEDENTE': excesso, 'MEDIA': med, 'ESTOQUE_FINAL': est}
+                # Rastreador de excedentes para cálculo de transferências
+                tracker_estoque = {}
+                for _, row in df_global.iterrows():
+                    f_nome = row['FILIAL_NOME']
+                    c = row['CODIGO']
+                    est = float(row['ESTOQUE'])
+                    med = float(row['MEDIA_SISTEMA'])
+                    excesso = est if med == 0 else max(0.0, est - (med * meta))
+                    tracker_estoque[(f_nome, c)] = {'EXCEDENTE': excesso, 'MEDIA': med, 'ESTOQUE_FINAL': est}
 
-            # Lógica de Sugestão de Compras e Transferências
-            resultados = []
-            dash_qtd_comprar = 0
-            dash_qtd_transferida = 0
-            dash_itens_pico = 0
-            dash_itens_ruptura = 0
+                # Lógica de Sugestão de Compras e Transferências
+                resultados = []
+                dash_qtd_comprar = 0
+                dash_qtd_transferida = 0
+                dash_itens_pico = 0
+                dash_itens_ruptura = 0
 
-            # Mapeamento de múltiplos de fornecedor
-            regras_dict = dict(zip(st.session_state.df_regras['FORNECEDOR'].str.upper(), st.session_state.df_regras['MULTIPLO']))
-            multiplo_padrao = regras_dict.get('GERAL', 1)
+                # Mapeamento de múltiplos de fornecedor
+                regras_dict = dict(zip(st.session_state.df_regras['FORNECEDOR'].str.upper(), st.session_state.df_regras['MULTIPLO']))
+                multiplo_padrao = regras_dict.get('GERAL', 1)
 
-            for _, row in df_global.iterrows():
-                f_nome = row['FILIAL_NOME']
-                c = row['CODIGO']
-                med = float(row['MEDIA_SISTEMA'])
-                est = float(row['ESTOQUE'])
-                res = float(row['RESERVA'])
-                comp = float(row['COMPRADA'])
-                fornecedor = str(row['FORNECEDOR']).upper()
+                for _, row in df_global.iterrows():
+                    f_nome = row['FILIAL_NOME']
+                    c = row['CODIGO']
+                    med = float(row['MEDIA_SISTEMA'])
+                    est = float(row['ESTOQUE'])
+                    res = float(row['RESERVA'])
+                    comp = float(row['COMPRADA'])
+                    fornecedor = str(row['FORNECEDOR']).upper()
 
-                # Identificação de Picos
-                max_venda = max(row['MES_1'], row['MES_2'], row['MES_3'], row['MES_4'])
-                eh_pico = max_venda > (med * fator_pico) and med > 0
-                if eh_pico:
-                    dash_itens_pico += 1
+                    # Identificação de Picos
+                    max_venda = max(row['MES_1'], row['MES_2'], row['MES_3'], row['MES_4'])
+                    eh_pico = max_venda > (med * fator_pico) and med > 0
+                    if eh_pico:
+                        dash_itens_pico += 1
 
-                # Necessidade bruta
-                necessidade = max(0.0, (med * meta) - (est + comp - res))
+                    # Necessidade bruta
+                    necessidade = max(0.0, (med * meta) - (est + comp - res))
 
-                qtd_transf = 0.0
-                origem_transf = ""
+                    qtd_transf = 0.0
+                    origem_transf = ""
 
-                # Tenta buscar transferência de outras filiais com excesso
-                if necessidade > 0:
-                    dash_itens_ruptura += 1
-                    for (outra_filial, cod_item), dados_est in tracker_estoque.items():
-                        if cod_item == c and outra_filial != f_nome and dados_est['EXCEDENTE'] > 0:
-                            qtd_atendida = min(necessidade, dados_est['EXCEDENTE'])
-                            qtd_transf += qtd_atendida
-                            dados_est['EXCEDENTE'] -= qtd_atendida
-                            necessidade -= qtd_atendida
-                            origem_transf = outra_filial
-                            dash_qtd_transferida += qtd_atendida
-                            if necessidade == 0:
-                                break
+                    # Tenta buscar transferência de outras filiais com excesso
+                    if necessidade > 0:
+                        dash_itens_ruptura += 1
+                        for (outra_filial, cod_item), dados_est in tracker_estoque.items():
+                            if cod_item == c and outra_filial != f_nome and dados_est['EXCEDENTE'] > 0:
+                                qtd_atendida = min(necessidade, dados_est['EXCEDENTE'])
+                                qtd_transf += qtd_atendida
+                                dados_est['EXCEDENTE'] -= qtd_atendida
+                                necessidade -= qtd_atendida
+                                origem_transf = outra_filial
+                                dash_qtd_transferida += qtd_atendida
+                                if necessidade == 0:
+                                    break
 
-                # Múltiplo de embalagem/fornecedor
-                mult = regras_dict.get(fornecedor, multiplo_padrao)
-                qtd_comprar = math.ceil(necessidade / mult) * mult if necessidade > 0 else 0
-                dash_qtd_comprar += qtd_comprar
+                    # Múltiplo de embalagem/fornecedor
+                    mult = regras_dict.get(fornecedor, multiplo_padrao)
+                    qtd_comprar = math.ceil(necessidade / mult) * mult if necessidade > 0 else 0
+                    dash_qtd_comprar += qtd_comprar
 
-                # Status visual
-                if qtd_comprar > 0:
-                    status = "🔴 RUPTURA / COMPRAR"
-                elif qtd_transf > 0:
-                    status = f"🔵 TRANSFERIR DE {origem_transf}"
-                elif med == 0 and est > 0:
-                    status = "🟡 EXCESSO / SEM GIRO"
-                else:
-                    status = "🟢 OK"
+                    # Status visual
+                    if qtd_comprar > 0:
+                        status = "🔴 RUPTURA / COMPRAR"
+                    elif qtd_transf > 0:
+                        status = f"🔵 TRANSFERIR DE {origem_transf}"
+                    elif med == 0 and est > 0:
+                        status = "🟡 EXCESSO / SEM GIRO"
+                    else:
+                        status = "🟢 OK"
 
-                resultados.append({
-                    'FILIAL': f_nome,
-                    'CODIGO': c,
-                    'DESCRICAO': row['DESCRICAO'],
-                    'FORNECEDOR': fornecedor,
-                    'MEDIA': med,
-                    'ESTOQUE': est,
-                    'COMPRADA': comp,
-                    'SUG_COMPRA': qtd_comprar,
-                    'SUG_TRANSF': qtd_transf,
-                    'ORIGEM_TRANSF': origem_transf,
-                    'STATUS': status,
-                    'MES_1': row['MES_1'],
-                    'MES_2': row['MES_2'],
-                    'MES_3': row['MES_3'],
-                    'MES_4': row['MES_4']
-                })
+                    resultados.append({
+                        'FILIAL': f_nome,
+                        'CODIGO': c,
+                        'DESCRICAO': row['DESCRICAO'],
+                        'FORNECEDOR': fornecedor,
+                        'MEDIA': med,
+                        'ESTOQUE': est,
+                        'COMPRADA': comp,
+                        'SUG_COMPRA': qtd_comprar,
+                        'SUG_TRANSF': qtd_transf,
+                        'ORIGEM_TRANSF': origem_transf,
+                        'STATUS': status,
+                        'MES_1': row['MES_1'],
+                        'MES_2': row['MES_2'],
+                        'MES_3': row['MES_3'],
+                        'MES_4': row['MES_4']
+                    })
 
-            df_final = pd.DataFrame(resultados)
+                df_final = pd.DataFrame(resultados)
 
-            # --- PAINEL DE MÉTRICAS (DASHBOARD) ---
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Unidades a Comprar", f"{dash_qtd_comprar:,.0f}".replace(",", "."))
-            m2.metric("Unidades a Transferir", f"{dash_qtd_transferida:,.0f}".replace(",", "."))
-            m3.metric("Itens em Ruptura", dash_itens_ruptura)
-            m4.metric("Alertas de Pico", dash_itens_pico)
+                # --- PAINEL DE MÉTRICAS (DASHBOARD) ---
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Unidades a Comprar", f"{dash_qtd_comprar:,.0f}".replace(",", "."))
+                m2.metric("Unidades a Transferir", f"{dash_qtd_transferida:,.0f}".replace(",", "."))
+                m3.metric("Itens em Ruptura", dash_itens_ruptura)
+                m4.metric("Alertas de Pico", dash_itens_pico)
 
-            st.markdown("---")
+                st.markdown("---")
 
-            # --- TABELA DE VISUALIZAÇÃO NO STREAMLIT ---
-            df_view = df_final[['FILIAL', 'CODIGO', 'DESCRICAO', 'FORNECEDOR', 'MEDIA', 'ESTOQUE', 'COMPRADA', 'SUG_COMPRA', 'SUG_TRANSF', 'STATUS']]
-            st.dataframe(df_view.style.apply(pintar_tabela, axis=1), use_container_width=True)
+                # --- TABELA DE VISUALIZAÇÃO NO STREAMLIT ---
+                df_view = df_final[['FILIAL', 'CODIGO', 'DESCRICAO', 'FORNECEDOR', 'MEDIA', 'ESTOQUE', 'COMPRADA', 'SUG_COMPRA', 'SUG_TRANSF', 'STATUS']]
+                st.dataframe(df_view.style.apply(pintar_tabela, axis=1), use_container_width=True)
 
-            # --- GERADOR DE EXCEL (OPENPYXL) ---
-            buffer = BytesIO()
-            wb = Workbook()
-            ws = wb.active
-            ws.title = "Plano_de_Compras"
+                # --- GERADOR DE EXCEL (OPENPYXL) ---
+                buffer = BytesIO()
+                wb = Workbook()
+                ws = wb.active
+                ws.title = "Plano_de_Compras"
 
-            # Estilos de Excel
-            header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
-            header_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
-            border_thin = Border(left=Side(style='thin', color='D9D9D9'),
-                                 right=Side(style='thin', color='D9D9D9'),
-                                 top=Side(style='thin', color='D9D9D9'),
-                                 bottom=Side(style='thin', color='D9D9D9'))
+                # Estilos do Excel
+                header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
+                header_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+                border_thin = Border(left=Side(style='thin', color='D9D9D9'),
+                                     right=Side(style='thin', color='D9D9D9'),
+                                     top=Side(style='thin', color='D9D9D9'),
+                                     bottom=Side(style='thin', color='D9D9D9'))
 
-            # Cabeçalhos do Excel
-            colunas = list(df_final.columns)
-            ws.append(colunas)
-            for col_num, col_name in enumerate(colunas, 1):
-                cell = ws.cell(row=1, column=col_num)
-                cell.fill = header_fill
-                cell.font = header_font
-                cell.alignment = Alignment(horizontal="center", vertical="center")
+                # Cabeçalhos
+                colunas = list(df_final.columns)
+                ws.append(colunas)
+                for col_num, col_name in enumerate(colunas, 1):
+                    cell = ws.cell(row=1, column=col_num)
+                    cell.fill = header_fill
+                    cell.font = header_font
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
 
-            # Dados
-            for row in df_final.itertuples(index=False):
-                ws.append(list(row))
+                # Dados
+                for row in df_final.itertuples(index=False):
+                    ws.append(list(row))
 
-            # Formatação de bordas e alinhamentos
-            for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=1, max_col=len(colunas)):
-                for cell in row:
-                    cell.border = border_thin
-                    if isinstance(cell.value, (int, float)):
-                        cell.number_format = '#,##0.00'
+                # Formatação de bordas e alinhamentos
+                for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=1, max_col=len(colunas)):
+                    for cell in row:
+                        cell.border = border_thin
+                        if isinstance(cell.value, (int, float)):
+                            cell.number_format = '#,##0.00'
 
-            # Auto-ajuste de largura das colunas
-            for col in ws.columns:
-                max_len = max(len(str(cell.value or '')) for cell in col)
-                col_letter = get_column_letter(col[0].column)
-                ws.column_dimensions[col_letter].width = max(max_len + 3, 12)
+                # Auto-ajuste de largura das colunas
+                for col in ws.columns:
+                    max_len = max(len(str(cell.value or '')) for cell in col)
+                    col_letter = get_column_letter(col[0].column)
+                    ws.column_dimensions[col_letter].width = max(max_len + 3, 12)
 
-            wb.save(buffer)
-            buffer.seek(0)
+                wb.save(buffer)
+                buffer.seek(0)
 
-            # Botão de Download
-            st.download_button(
-                label="📥 Baixar Relatório em Excel",
-                data=buffer,
-                file_name=nome_final_xlsx,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
+                # Botão de Download
+                st.download_button(
+                    label="📥 Baixar Relatório em Excel",
+                    data=buffer,
+                    file_name=nome_final_xlsx,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
 
-        except Exception as e:
-            st.error(f"Erro ao processar arquivos: {e}")
-            st.text(traceback.format_exc())
+            except Exception as e:
+                st.error(f"Erro ao processar arquivos: {e}")
+                st.text(traceback.format_exc())
 
 else:
     st.info("A aguardar documentos. Por favor, carregue os ficheiros PDF na barra lateral para iniciar.")
