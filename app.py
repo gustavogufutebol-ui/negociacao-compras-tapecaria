@@ -4,6 +4,7 @@ import pdfplumber
 import re
 import math
 import traceback
+import plotly.express as px
 from io import BytesIO
 from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font, Border, Side, Alignment
@@ -12,18 +13,37 @@ from openpyxl.utils import get_column_letter
 # --- CONFIGURAÇÃO DA PÁGINA ---
 st.set_page_config(page_title="Portal Compras - Tapeçaria", layout="wide")
 
-# --- INICIALIZAÇÃO DE ESTADO (MÚLTIPLOS E REGRAS) ---
+# --- INICIALIZAÇÃO DE ESTADO ---
+if "uploader_key" not in st.session_state:
+    st.session_state.uploader_key = 0
+
+if "analise_concluida" not in st.session_state:
+    st.session_state.analise_concluida = False
+
 if "df_regras" not in st.session_state:
     st.session_state.df_regras = pd.DataFrame([
-        {"FORNECEDOR": "FORNECEDOR A", "MULTIPLO": 10},
-        {"FORNECEDOR": "FORNECEDOR B", "MULTIPLO": 50},
-        {"FORNECEDOR": "GERAL", "MULTIPLO": 1}
+        {"FORNECEDOR": "CORTTEX", "MULTIPLO": 50, "TOLERANCIA": 20, "PALAVRA_CHAVE": ""},
+        {"FORNECEDOR": "TEX COMPANY", "MULTIPLO": 50, "TOLERANCIA": 20, "PALAVRA_CHAVE": ""},
+        {"FORNECEDOR": "CIPATEX", "MULTIPLO": 50, "TOLERANCIA": 20, "PALAVRA_CHAVE": ""},
+        {"FORNECEDOR": "KARSTEN", "MULTIPLO": 50, "TOLERANCIA": 20, "PALAVRA_CHAVE": ""},
+        {"FORNECEDOR": "ETRURIA", "MULTIPLO": 50, "TOLERANCIA": 20, "PALAVRA_CHAVE": ""},
+        {"FORNECEDOR": "TELLAIO", "MULTIPLO": 50, "TOLERANCIA": 20, "PALAVRA_CHAVE": ""},
+        {"FORNECEDOR": "OBER", "MULTIPLO": 50, "TOLERANCIA": 20, "PALAVRA_CHAVE": ""},
+        {"FORNECEDOR": "TEXTIL J. SERRANO", "MULTIPLO": 50, "TOLERANCIA": 20, "PALAVRA_CHAVE": ""},
+        {"FORNECEDOR": "CKS", "MULTIPLO": 50, "TOLERANCIA": 20, "PALAVRA_CHAVE": ""},
+        {"FORNECEDOR": "AGRO QUIMICA", "MULTIPLO": 45, "TOLERANCIA": 20, "PALAVRA_CHAVE": ""},
+        {"FORNECEDOR": "ROMPLAS", "MULTIPLO": 30, "TOLERANCIA": 15, "PALAVRA_CHAVE": "URUGUA"},
+        {"FORNECEDOR": "ROMA DUBLADOS", "MULTIPLO": 10, "TOLERANCIA": 5, "PALAVRA_CHAVE": ""}
     ])
+
+def limpar_dados():
+    st.session_state.uploader_key += 1
+    st.session_state.analise_concluida = False
+    st.rerun()
 
 # --- FUNÇÕES DE SUPORTE E LEITURA DE PDF ---
 def limpar_v(val):
-    """Converte valores numéricos no formato brasileiro (ex: '1.234,56' ou '0,00') para float."""
-    if not val or val == '-' or val == 'S/N':
+    if not val or val in ['-', 'S/N', 'N/A']:
         return 0.0
     val_limpo = str(val).replace('.', '').replace(',', '.')
     try:
@@ -32,10 +52,6 @@ def limpar_v(val):
         return 0.0
 
 def extrair_dados_pdf_web(file):
-    """
-    Lê o PDF de forma flexível e resiliente, tratando colunas dinâmicas,
-    códigos com asteriscos (***) e a coluna adicional de SITUAÇÃO.
-    """
     dados = []
     meses_cabecalho = []
     nome_filial = file.name.replace(".pdf", "").upper()
@@ -51,32 +67,26 @@ def extrair_dados_pdf_web(file):
             for l in linhas:
                 l_str = l.strip()
 
-                # Identificação de Fornecedor no Cabeçalho
                 if "FORNECEDOR:" in l_str.upper():
                     partes_forn = l_str.upper().split("FORNECEDOR:")
                     if len(partes_forn) > 1:
                         fornecedor_atual = partes_forn[1].split("-")[0].strip()
 
-                # Identificação dos Meses no Cabeçalho da Tabela
                 if "CÓDIGO" in l_str.upper() and "DESCRIÇÃO" in l_str.upper():
                     partes_h = l_str.split()
                     cand_meses = [p for p in partes_h if len(p) == 3 and p.isalpha()]
                     if len(cand_meses) >= 4 and not meses_cabecalho:
                         meses_cabecalho = [m.upper() for m in cand_meses[:4]]
 
-                # Limpeza de asteriscos no início do código (ex: ***16759)
                 l_limpa = re.sub(r'^\*+\s*', '', l_str)
-
-                # Busca por código numérico válido de produto (3 a 6 dígitos)
                 match_cod = re.search(r'\b\d{3,6}\b', l_limpa)
+
                 if match_cod:
                     codigo = match_cod.group(0)
                     partes = l_limpa.split()
 
-                    # Garante que a linha tenha os elementos da tabela
                     if len(partes) >= 12:
                         try:
-                            # Leitura dinâmica pegando as posições a partir do final
                             item_dict = {
                                 'CODIGO': codigo,
                                 'DESCRICAO': " ".join([p for p in partes if not p.replace(',', '.').replace('-', '').replace('.', '').isdigit() and p != codigo])[:50],
@@ -104,17 +114,6 @@ def extrair_dados_pdf_web(file):
 
     return df_res, meses_cabecalho
 
-def pintar_tabela(val):
-    """Aplica cores dinâmicas nas linhas do Dataframe no Streamlit."""
-    status = val.get('STATUS', '')
-    if 'RUPTURA' in str(status):
-        return ['background-color: #ffcccc'] * len(val)
-    elif 'TRANSFERIR' in str(status):
-        return ['background-color: #e6f2ff'] * len(val)
-    elif 'EXCESSO' in str(status):
-        return ['background-color: #fff2cc'] * len(val)
-    return [''] * len(val)
-
 # --- INTERFACE WEB (BARRA LATERAL) ---
 with st.sidebar:
     try:
@@ -124,7 +123,14 @@ with st.sidebar:
 
     st.markdown("---")
     st.header("📂 Nova Compra")
-    uploaded_files = st.file_uploader("Selecione os 4 PDFs das Unidades", type="pdf", accept_multiple_files=True)
+    uploaded_files = st.file_uploader(
+        "Selecione os 4 PDFs das Unidades", 
+        type="pdf", 
+        accept_multiple_files=True,
+        key=f"pdf_uploader_{st.session_state.uploader_key}"
+    )
+    
+    st.button("🧹 Limpar Dados para Nova Compra", on_click=limpar_dados, use_container_width=True)
     st.markdown("---")
 
     with st.expander("⚙️ Configurações Avançadas"):
@@ -152,11 +158,9 @@ with col2:
 st.markdown("##### Portal Operacional - Tapeçaria")
 st.markdown("<br>", unsafe_allow_html=True)
 
-# ====================================================
-# === PROCESSAMENTO AUTOMÁTICO ("PISCOU, MUDOU") ===
-# ====================================================
+# --- PROCESSAMENTO AUTOMÁTICO ---
 if uploaded_files:
-    with st.spinner("🔍 Processando arquivos PDF e calculando regras de estoque..."):
+    with st.spinner("🔍 Lendo arquivos PDF e executando cálculo das regras de compras..."):
         dfs_por_filial = {}
         todos_dados = []
         meses_globais = []
@@ -182,7 +186,6 @@ if uploaded_files:
                 vendas_recentes = df_global['MES_1'] + df_global['MES_2'] + df_global['MES_3'] + df_global['MES_4']
                 df_global['TOTAL_VENDAS_RECENTES'] = vendas_recentes
 
-                # Rastreador de excedentes para cálculo de transferências
                 tracker_estoque = {}
                 for _, row in df_global.iterrows():
                     f_nome = row['FILIAL_NOME']
@@ -192,154 +195,183 @@ if uploaded_files:
                     excesso = est if med == 0 else max(0.0, est - (med * meta))
                     tracker_estoque[(f_nome, c)] = {'EXCEDENTE': excesso, 'MEDIA': med, 'ESTOQUE_FINAL': est}
 
-                # Lógica de Sugestão de Compras e Transferências
-                resultados = []
                 dash_qtd_comprar = 0
                 dash_qtd_transferida = 0
                 dash_itens_pico = 0
                 dash_itens_ruptura = 0
 
-                # Mapeamento de múltiplos de fornecedor
                 regras_dict = dict(zip(st.session_state.df_regras['FORNECEDOR'].str.upper(), st.session_state.df_regras['MULTIPLO']))
-                multiplo_padrao = regras_dict.get('GERAL', 1)
 
-                for _, row in df_global.iterrows():
-                    f_nome = row['FILIAL_NOME']
-                    c = row['CODIGO']
-                    med = float(row['MEDIA_SISTEMA'])
-                    est = float(row['ESTOQUE'])
-                    res = float(row['RESERVA'])
-                    comp = float(row['COMPRADA'])
-                    fornecedor = str(row['FORNECEDOR']).upper()
+                for f_nome, df_f in dfs_por_filial.items():
+                    suge_compra = []
+                    trans_interna = []
+                    ruptura_critica = []
+                    venda_atipica = []
+                    est_parado = []
 
-                    # Identificação de Picos
-                    max_venda = max(row['MES_1'], row['MES_2'], row['MES_3'], row['MES_4'])
-                    eh_pico = max_venda > (med * fator_pico) and med > 0
-                    if eh_pico:
-                        dash_itens_pico += 1
+                    for _, row in df_f.iterrows():
+                        c = row['CODIGO']
+                        med = float(row['MEDIA_SISTEMA'])
+                        est = float(row['ESTOQUE'])
+                        comp = float(row['COMPRADA'])
+                        res = float(row['RESERVA'])
+                        fornecedor = str(row['FORNECEDOR']).upper()
 
-                    # Necessidade bruta
-                    necessidade = max(0.0, (med * meta) - (est + comp - res))
+                        # Análise de Ruptura
+                        if est == 0 and comp == 0 and med > 0:
+                            ruptura_critica.append("🚨 CRÍTICA")
+                            dash_itens_ruptura += 1
+                        else:
+                            ruptura_critica.append("OK")
 
-                    qtd_transf = 0.0
-                    origem_transf = ""
+                        # Análise de Pico
+                        max_venda = max(row['MES_1'], row['MES_2'], row['MES_3'], row['MES_4'])
+                        if max_venda > (med * fator_pico) and med > 0:
+                            venda_atipica.append("⚠️ SIM")
+                            dash_itens_pico += 1
+                        else:
+                            venda_atipica.append("NÃO")
 
-                    # Tenta buscar transferência de outras filiais com excesso
-                    if necessidade > 0:
-                        dash_itens_ruptura += 1
-                        for (outra_filial, cod_item), dados_est in tracker_estoque.items():
-                            if cod_item == c and outra_filial != f_nome and dados_est['EXCEDENTE'] > 0:
-                                qtd_atendida = min(necessidade, dados_est['EXCEDENTE'])
-                                qtd_transf += qtd_atendida
-                                dados_est['EXCEDENTE'] -= qtd_atendida
-                                necessidade -= qtd_atendida
-                                origem_transf = outra_filial
-                                dash_qtd_transferida += qtd_atendida
-                                if necessidade == 0:
-                                    break
+                        # Análise de Parado
+                        vendas_tot = row['MES_1'] + row['MES_2'] + row['MES_3'] + row['MES_4']
+                        if vendas_tot == 0 and est > 0:
+                            est_parado.append("🛑 SIM")
+                        else:
+                            est_parado.append("NÃO")
 
-                    # Múltiplo de embalagem/fornecedor
-                    mult = regras_dict.get(fornecedor, multiplo_padrao)
-                    qtd_comprar = math.ceil(necessidade / mult) * mult if necessidade > 0 else 0
-                    dash_qtd_comprar += qtd_comprar
+                        # Cálculo de Necessidade e Transferência
+                        necessidade = max(0.0, (med * meta) - (est + comp - res))
+                        qtd_transf = 0.0
+                        origem = ""
 
-                    # Status visual
-                    if qtd_comprar > 0:
-                        status = "🔴 RUPTURA / COMPRAR"
-                    elif qtd_transf > 0:
-                        status = f"🔵 TRANSFERIR DE {origem_transf}"
-                    elif med == 0 and est > 0:
-                        status = "🟡 EXCESSO / SEM GIRO"
-                    else:
-                        status = "🟢 OK"
+                        if necessidade > 0:
+                            for (outra_f, cod_item), d_est in tracker_estoque.items():
+                                if cod_item == c and outra_f != f_nome and d_est['EXCEDENTE'] > 0:
+                                    atend = min(necessidade, d_est['EXCEDENTE'])
+                                    qtd_transf += atend
+                                    d_est['EXCEDENTE'] -= atend
+                                    necessidade -= atend
+                                    origem = outra_f
+                                    dash_qtd_transferida += atend
+                                    if necessidade == 0:
+                                        break
 
-                    resultados.append({
-                        'FILIAL': f_nome,
-                        'CODIGO': c,
-                        'DESCRICAO': row['DESCRICAO'],
-                        'FORNECEDOR': fornecedor,
-                        'MEDIA': med,
-                        'ESTOQUE': est,
-                        'COMPRADA': comp,
-                        'SUG_COMPRA': qtd_comprar,
-                        'SUG_TRANSF': qtd_transf,
-                        'ORIGEM_TRANSF': origem_transf,
-                        'STATUS': status,
-                        'MES_1': row['MES_1'],
-                        'MES_2': row['MES_2'],
-                        'MES_3': row['MES_3'],
-                        'MES_4': row['MES_4']
-                    })
+                        mult = regras_dict.get(fornecedor, 1)
+                        qtd_compra = math.ceil(necessidade / mult) * mult if necessidade > 0 else 0
+                        dash_qtd_comprar += qtd_compra
 
-                df_final = pd.DataFrame(resultados)
+                        suge_compra.append(qtd_compra)
+                        trans_interna.append(f"{qtd_transf:.0f} DE {origem}" if qtd_transf > 0 else "0")
 
-                # --- PAINEL DE MÉTRICAS (DASHBOARD) ---
-                m1, m2, m3, m4 = st.columns(4)
-                m1.metric("Unidades a Comprar", f"{dash_qtd_comprar:,.0f}".replace(",", "."))
-                m2.metric("Unidades a Transferir", f"{dash_qtd_transferida:,.0f}".replace(",", "."))
-                m3.metric("Itens em Ruptura", dash_itens_ruptura)
-                m4.metric("Alertas de Pico", dash_itens_pico)
+                    df_f['SUGESTAO COMPRA'] = suge_compra
+                    df_f['TRANS INTERNA'] = trans_interna
+                    df_f['RUPTURA CRÍTICA'] = ruptura_critica
+                    df_f['VENDA_ATIPICA'] = venda_atipica
+                    df_f['ESTOQUE PARADO'] = est_parado
+                    df_f['MEDIA'] = df_f['MEDIA_SISTEMA']
 
-                st.markdown("---")
+                df_p = df_global[(df_global['TOTAL_VENDAS_RECENTES'] == 0) & (df_global['ESTOQUE_DISPONIVEL'] > 0)].copy()
 
-                # --- TABELA DE VISUALIZAÇÃO NO STREAMLIT ---
-                df_view = df_final[['FILIAL', 'CODIGO', 'DESCRICAO', 'FORNECEDOR', 'MEDIA', 'ESTOQUE', 'COMPRADA', 'SUG_COMPRA', 'SUG_TRANSF', 'STATUS']]
-                st.dataframe(df_view.style.apply(pintar_tabela, axis=1), use_container_width=True)
-
-                # --- GERADOR DE EXCEL (OPENPYXL) ---
-                buffer = BytesIO()
-                wb = Workbook()
-                ws = wb.active
-                ws.title = "Plano_de_Compras"
-
-                # Estilos do Excel
-                header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
-                header_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
-                border_thin = Border(left=Side(style='thin', color='D9D9D9'),
-                                     right=Side(style='thin', color='D9D9D9'),
-                                     top=Side(style='thin', color='D9D9D9'),
-                                     bottom=Side(style='thin', color='D9D9D9'))
-
-                # Cabeçalhos
-                colunas = list(df_final.columns)
-                ws.append(colunas)
-                for col_num, col_name in enumerate(colunas, 1):
-                    cell = ws.cell(row=1, column=col_num)
-                    cell.fill = header_fill
-                    cell.font = header_font
-                    cell.alignment = Alignment(horizontal="center", vertical="center")
-
-                # Dados
-                for row in df_final.itertuples(index=False):
-                    ws.append(list(row))
-
-                # Formatação de bordas e alinhamentos
-                for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=1, max_col=len(colunas)):
-                    for cell in row:
-                        cell.border = border_thin
-                        if isinstance(cell.value, (int, float)):
-                            cell.number_format = '#,##0.00'
-
-                # Auto-ajuste de largura das colunas
-                for col in ws.columns:
-                    max_len = max(len(str(cell.value or '')) for cell in col)
-                    col_letter = get_column_letter(col[0].column)
-                    ws.column_dimensions[col_letter].width = max(max_len + 3, 12)
-
-                wb.save(buffer)
-                buffer.seek(0)
-
-                # Botão de Download
-                st.download_button(
-                    label="📥 Baixar Relatório em Excel",
-                    data=buffer,
-                    file_name=nome_final_xlsx,
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
+                st.session_state.dfs_por_filial = dfs_por_filial
+                st.session_state.dash_qtd_comprar = dash_qtd_comprar
+                st.session_state.dash_qtd_transferida = dash_qtd_transferida
+                st.session_state.dash_itens_pico = dash_itens_pico
+                st.session_state.dash_itens_ruptura = dash_itens_ruptura
+                st.session_state.df_p = df_p
+                st.session_state.analise_concluida = True
 
             except Exception as e:
-                st.error(f"Erro ao processar arquivos: {e}")
-                st.text(traceback.format_exc())
+                st.error(f"🚨 Ocorreu um erro durante os cálculos: {e}")
+                st.code(traceback.format_exc())
+
+# --- RENDERIZAÇÃO DAS ABAS ---
+if st.session_state.analise_concluida:
+    dfs_por_filial = st.session_state.dfs_por_filial
+    dash_qtd_comprar = st.session_state.dash_qtd_comprar
+    dash_qtd_transferida = st.session_state.dash_qtd_transferida
+    dash_itens_pico = st.session_state.dash_itens_pico
+    dash_itens_ruptura = st.session_state.dash_itens_ruptura
+    df_p = st.session_state.df_p
+
+    tab1, tab2, tab3, tab4 = st.tabs(["📊 Visão Geral", "🚨 Top Urgentes", "📦 Estoque Parado", "🔍 Prévia por Filial"])
+
+    with tab1:
+        st.subheader("Indicadores de Desempenho")
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("🛒 Sugestão de Compra", f"{int(dash_qtd_comprar)} un.")
+        c2.metric("🔄 Economia (Transf.)", f"{int(dash_qtd_transferida)} un.")
+        c3.metric("⚠️ Picos de Vendas", f"{int(dash_itens_pico)} itens")
+        c4.metric("🚨 Rupturas Críticas", f"{int(dash_itens_ruptura)} itens")
+
+        if not df_p.empty:
+            f_p = df_p.groupby('FILIAL_NOME')['ESTOQUE_DISPONIVEL'].sum().idxmax()
+        else:
+            f_p = "Nenhuma"
+        c5.metric("📦 Maior Estoque Parado", f_p)
+
+        st.success("✅ Processamento concluído com sucesso!")
+
+    with tab2:
+        df_all = pd.concat(dfs_por_filial.values())
+        df_rupturas = df_all[df_all['RUPTURA CRÍTICA'] == "🚨 CRÍTICA"].sort_values(by='MEDIA', ascending=False)
+        if not df_rupturas.empty:
+            st.error("🚨 PRODUTOS EM RUPTURA CRÍTICA DETECTADOS (Estoque Zero + Sem Pedido em Andamento)")
+            st.dataframe(df_rupturas[['CODIGO', 'DESCRICAO', 'FILIAL_NOME', 'MEDIA', 'SUGESTAO COMPRA', 'FORNECEDOR']], use_container_width=True)
+        else:
+            st.success("✅ Nenhuma ruptura crítica absoluta detectada nas filiais!")
+
+        st.markdown("<br><hr>", unsafe_allow_html=True)
+        st.subheader("🛒 Maior Volume de Compra Sugerido (Top 15)")
+        top_compra = df_all[df_all['SUGESTAO COMPRA'] > 0].sort_values(by='SUGESTAO COMPRA', ascending=False).head(15)
+        st.dataframe(top_compra[['CODIGO', 'DESCRICAO', 'FILIAL_NOME', 'SUGESTAO COMPRA', 'FORNECEDOR']], use_container_width=True)
+
+    with tab3:
+        st.subheader("Distribuição de Estoque Excedente / Sem Giro")
+        if not df_p.empty:
+            grafico_dados = df_p.groupby('FILIAL_NOME')['ESTOQUE_DISPONIVEL'].sum().reset_index()
+            fig = px.bar(
+                grafico_dados, 
+                x='FILIAL_NOME', 
+                y='ESTOQUE_DISPONIVEL', 
+                title="Volume de Estoque Acima do Limite de Giro por Filial", 
+                color='ESTOQUE_DISPONIVEL', 
+                color_continuous_scale='Reds'
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("Nenhum estoque crítico/parado foi detectado com base nos parâmetros configurados.")
+
+    with tab4:
+        st.subheader("Prévia Colorida dos Dados por Filial")
+        sel_f = st.selectbox("Selecione a Filial para visualizar:", list(dfs_por_filial.keys()))
+        df_view = dfs_por_filial[sel_f].copy()
+
+        def pintar_tabela(row):
+            cols = row.index
+            estilos = [''] * len(cols)
+            def f_idx(nome): return cols.get_loc(nome) if nome in cols else -1
+
+            i_parado = f_idx('ESTOQUE PARADO')
+            i_estoque = f_idx('ESTOQUE')
+            i_atipica = f_idx('VENDA_ATIPICA')
+            i_compra = f_idx('SUGESTAO COMPRA')
+            i_transf = f_idx('TRANS INTERNA')
+            i_comprada = f_idx('COMPRADA')
+            i_ruptura = f_idx('RUPTURA CRÍTICA')
+
+            if i_parado >= 0 and '🛑 SIM' in str(row.get('ESTOQUE PARADO', '')):
+                estilos[i_parado] = 'background-color: #F4CCCC; color: black;'
+                if i_estoque >= 0: estilos[i_estoque] = 'background-color: #F4CCCC; color: black;'
+            if i_atipica >= 0 and '⚠️ SIM' in str(row.get('VENDA_ATIPICA', '')): estilos[i_atipica] = 'background-color: #FFF2CC; color: black;'
+            if i_compra >= 0 and pd.to_numeric(row.get('SUGESTAO COMPRA', 0), errors='coerce') > 0: estilos[i_compra] = 'background-color: #D9EAD3; color: black;'
+            if i_transf >= 0 and str(row.get('TRANS INTERNA', '')) not in ['0', 'None', '', 'nan']: estilos[i_transf] = 'background-color: #C9DAF8; color: black;'
+            if i_comprada >= 0 and pd.to_numeric(row.get('COMPRADA', 0), errors='coerce') > 0: estilos[i_comprada] = 'background-color: #FCE5CD; color: black;'
+            if i_ruptura >= 0 and '🚨 CRÍTICA' in str(row.get('RUPTURA CRÍTICA', '')):
+                estilos[i_ruptura] = 'background-color: #FFD2D2; color: black; font-weight: bold;'
+                if i_estoque >= 0: estilos[i_estoque] = 'background-color: #FFD2D2; color: black;'
+            return estilos
+
+        st.dataframe(df_view.style.apply(pintar_tabela, axis=1), use_container_width=True)
 
 else:
-    st.info("A aguardar documentos. Por favor, carregue os ficheiros PDF na barra lateral para iniciar.")
+    st.info("Aguardando documentos. Por favor, selecione os ficheiros PDF na barra lateral para iniciar a análise.")
