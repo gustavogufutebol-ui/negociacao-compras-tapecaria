@@ -4,283 +4,346 @@ import pdfplumber
 import re
 import math
 import traceback
+import plotly.express as px
 from io import BytesIO
-import openpyxl
-from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+from openpyxl import Workbook
+from openpyxl.styles import PatternFill, Font, Border, Side, Alignment
 from openpyxl.utils import get_column_letter
+from openpyxl.formatting.rule import FormulaRule
 
-# ==========================================
 # --- CONFIGURAÇÃO DA PÁGINA ---
-# ==========================================
-st.set_page_config(page_title="Negociações de Compras", layout="wide")
+st.set_page_config(page_title="Portal Compras - Tapeçaria", layout="wide")
 
-# ==========================================
-# --- VARIÁVEIS DE SESSÃO / REGRAS DE EMBALAGEM ---
-# ==========================================
+# --- INICIALIZAÇÃO DE ESTADO (MÚLTIPLOS E REGRAS) ---
 if "df_regras" not in st.session_state:
     st.session_state.df_regras = pd.DataFrame([
-        {"FORNECEDOR": "YORK", "MULTIPLO": 50, "TOLERANCIA": 20, "PALAVRA_CHAVE": ""},
-        {"FORNECEDOR": "CORTTEX", "MULTIPLO": 50, "TOLERANCIA": 20, "PALAVRA_CHAVE": ""},
-        {"FORNECEDOR": "TEX COMPANY", "MULTIPLO": 50, "TOLERANCIA": 20, "PALAVRA_CHAVE": ""},
-        {"FORNECEDOR": "CIPATEX", "MULTIPLO": 50, "TOLERANCIA": 20, "PALAVRA_CHAVE": ""},
-        {"FORNECEDOR": "ROMPLAS", "MULTIPLO": 30, "TOLERANCIA": 15, "PALAVRA_CHAVE": "URUGUA"},
-        {"FORNECEDOR": "ROMA DUBLADOS", "MULTIPLO": 10, "TOLERANCIA": 5, "PALAVRA_CHAVE": ""}
+        {"FORNECEDOR": "FORNECEDOR A", "MULTIPLO": 10},
+        {"FORNECEDOR": "FORNECEDOR B", "MULTIPLO": 50},
+        {"FORNECEDOR": "GERAL", "MULTIPLO": 1}
     ])
 
-if "uploader_key" not in st.session_state:
-    st.session_state.uploader_key = 0
-
-# ==========================================
-# --- FUNÇÃO DE LEITURA DE PDF ---
-# ==========================================
-def extrair_dados_pdf(file_bytes):
-    """Extrai código, descrição, estoque, vendas e fornecedor dos PDFs de relatório."""
-    dados = []
+# --- FUNÇÕES DE SUPORTE E LEITURA DE PDF ---
+def limpar_v(val):
+    """Converte valores numéricos no formato brasileiro (ex: '1.234,56' ou '0,00') para float."""
+    if not val or val == '-' or val == 'S/N':
+        return 0.0
+    val_limpo = str(val).replace('.', '').replace(',', '.')
     try:
-        with pdfplumber.open(file_bytes) as pdf:
-            for page in pdf.pages:
-                text = page.extract_text()
-                if not text:
-                    continue
-                for line in text.split('\n'):
-                    match = re.search(r'(\d+)\s+(.*?)\s+(\d+[\.,]?\d*)\s+(\d+[\.,]?\d*)\s+(.*)', line)
-                    if match:
-                        cod, desc, est, media, forn = match.groups()
-                        try:
-                            est_val = float(est.replace('.', '').replace(',', '.'))
-                            media_val = float(media.replace('.', '').replace(',', '.'))
-                        except:
-                            est_val, media_val = 0.0, 0.0
-                            
-                        dados.append({
-                            'CODIGO': cod.strip(),
-                            'DESCRICAO': desc.strip(),
-                            'ESTOQUE': est_val,
-                            'MEDIA_VENDAS': media_val,
-                            'FORNECEDOR': forn.strip().upper()
-                        })
-    except Exception as e:
-        st.error(f"Erro ao extrair PDF: {e}")
-    return pd.DataFrame(dados)
+        return float(val_limpo)
+    except ValueError:
+        return 0.0
 
-# ==========================================
-# --- FUNÇÃO DE ARREDONDAMENTO POR MÚLTIPLO ---
-# ==========================================
-def aplicar_multiplo(row, quantidade_sugerida):
-    if quantidade_sugerida <= 0:
-        return 0
-    
-    forn = str(row.get('FORNECEDOR', '')).upper()
-    desc = str(row.get('DESCRICAO', '')).upper()
-    
-    mult, tol = 1, 0
-    encontrou_regra = False
-    
-    for _, regra in st.session_state.df_regras.iterrows():
-        f_regra = str(regra.get('FORNECEDOR', '')).upper()
-        if f_regra and f_regra in forn:
-            p_chave = str(regra.get('PALAVRA_CHAVE', '')).upper().strip()
-            if p_chave and p_chave not in desc:
+def extrair_dados_pdf_web(file):
+    """
+    Lê o PDF de forma flexível e resiliente, tratando colunas dinâmicas,
+    códigos com asteriscos (***) e a coluna adicional de SITUAÇÃO.
+    """
+    dados = []
+    meses_cabecalho = []
+    nome_filial = file.name.replace(".pdf", "").upper()
+    fornecedor_atual = "DESCONHECIDO"
+
+    with pdfplumber.open(file) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text()
+            if not text:
                 continue
-            try:
-                mult = int(regra['MULTIPLO'])
-                tol = int(regra['TOLERANCIA'])
-                encontrou_regra = True
-                break
-            except:
-                pass
-                
-    if encontrou_regra and mult > 0:
-        base = (int(quantidade_sugerida) // mult) * mult
-        resto = quantidade_sugerida % mult
-        return int(base + mult) if resto >= tol else int(base)
-    
-    return int(math.ceil(quantidade_sugerida))
 
-# ==========================================
-# --- GERADOR DE EXCEL ---
-# ==========================================
-def gerar_excel(df_resultado, fornecedor_nome, vol_total):
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        df_resultado.to_excel(writer, index=False, sheet_name="Sugestao_Negociacao")
-        
-        ws = writer.sheets["Sugestao_Negociacao"]
-        header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
-        header_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
-        
-        for col in range(1, len(df_resultado.columns) + 1):
-            cell = ws.cell(row=1, column=col)
-            cell.fill = header_fill
-            cell.font = header_font
-            cell.alignment = Alignment(horizontal="center", vertical="center")
-            ws.column_dimensions[get_column_letter(col)].width = 24
-            
-    return output.getvalue()
+            linhas = text.split('\n')
+            for l in linhas:
+                l_str = l.strip()
 
-# ==========================================
-# --- BARRA LATERAL (PARÂMETROS DE NEGOCIAÇÃO) ---
-# ==========================================
+                # Identificação de Fornecedor no Cabeçalho
+                if "FORNECEDOR:" in l_str.upper():
+                    partes_forn = l_str.upper().split("FORNECEDOR:")
+                    if len(partes_forn) > 1:
+                        fornecedor_atual = partes_forn[1].split("-")[0].strip()
+
+                # Identificação dos Meses no Cabeçalho da Tabela
+                if "CÓDIGO" in l_str.upper() and "DESCRIÇÃO" in l_str.upper():
+                    partes_h = l_str.split()
+                    # Tenta capturar as colunas de meses (geralmente entre DESCRICAO/EMB e MEDIA)
+                    cand_meses = [p for p in partes_h if len(p) == 3 and p.isalpha()]
+                    if len(cand_meses) >= 4 and not meses_cabecalho:
+                        meses_cabecalho = [m.upper() for m in cand_meses[:4]]
+
+                # Limpeza de asteriscos no início do código
+                l_limpa = re.sub(r'^\*+\s*', '', l_str)
+
+                # Busca por código numérico válido de produto (3 a 6 dígitos)
+                match_cod = re.search(r'\b\d{3,6}\b', l_limpa)
+                if match_cod:
+                    codigo = match_cod.group(0)
+                    partes = l_limpa.split()
+
+                    # Garante que a linha tenha os elementos da tabela
+                    if len(partes) >= 12:
+                        try:
+                            # Leitura dinâmica pegando as posições a partir do final
+                            item_dict = {
+                                'CODIGO': codigo,
+                                'DESCRICAO': " ".join([p for p in partes if not p.replace(',', '.').replace('-', '').replace('.', '').isdigit() and p != codigo])[:50],
+                                'EMB.': partes[-12],
+                                'MES_1': limpar_v(partes[-11]),
+                                'MES_2': limpar_v(partes[-10]),
+                                'MES_3': limpar_v(partes[-9]),
+                                'MES_4': limpar_v(partes[-8]),
+                                'MEDIA_SISTEMA': limpar_v(partes[-7]),
+                                'ESTOQUE': limpar_v(partes[-6]),
+                                'RESERVA': limpar_v(partes[-5]),
+                                'COMPRADA': limpar_v(partes[-4]),
+                                'SITUACAO': partes[-2],
+                                'MESES_ESTOQUE': limpar_v(partes[-1]),
+                                'FILIAL_NOME': nome_filial,
+                                'FORNECEDOR': fornecedor_atual
+                            }
+                            dados.append(item_dict)
+                        except Exception:
+                            continue
+
+    df_res = pd.DataFrame(dados)
+    if meses_cabecalho and len(meses_cabecalho) < 4:
+        meses_cabecalho = ["MÊS 1", "MÊS 2", "MÊS 3", "MÊS 4"]
+    elif not meses_cabecalho:
+        meses_cabecalho = ["MÊS 1", "MÊS 2", "MÊS 3", "MÊS 4"]
+
+    return df_res, meses_cabecalho
+
+def pintar_tabela(val):
+    """Aplica cores dinâmicas nas linhas do Dataframe no Streamlit."""
+    status = val.get('STATUS', '')
+    if 'RUPTURA' in str(status):
+        return ['background-color: #ffcccc'] * len(val)
+    elif 'TRANSFERIR' in str(status):
+        return ['background-color: #e6f2ff'] * len(val)
+    elif 'EXCESSO' in str(status):
+        return ['background-color: #fff2cc'] * len(val)
+    return [''] * len(val)
+
+# --- INTERFACE WEB (BARRA LATERAL) ---
 with st.sidebar:
-    st.header("🤝 Parâmetros da Negociação")
-    fornecedor_alvo = st.text_input("Fornecedor Selecionado", value="YORK")
-    
-    st.markdown("---")
-    st.subheader("🎯 Filtro de Linha/Coleção")
-    filtro_palavra = st.text_input("Filtrar descrição por (opcional)", value="", placeholder="Ex: URUGUAI, SUEDE, CORINO")
-    
-    st.markdown("---")
-    st.subheader("📦 Volume Fechado")
-    volume_total = st.number_input("Volume Total Acordado (Mts / Un)", min_value=1, value=30000, step=1000)
-    
-    st.subheader("📅 Cronograma de Entregas")
-    c1, c2 = st.columns(2)
-    with c1:
-        rotulo_lote1 = st.text_input("Nome Lote 1", value="Setembro")
-        pct_lote1 = st.number_input("% Lote 1", min_value=0, max_value=100, value=60)
-    with c2:
-        rotulo_lote2 = st.text_input("Nome Lote 2", value="Outubro")
-        pct_lote2 = st.number_input("% Lote 2", min_value=0, max_value=100, value=40)
-        
-    st.markdown("---")
-    uploaded_files = st.file_uploader(
-        "Carregue os PDFs dos Produtos", 
-        type="pdf", 
-        accept_multiple_files=True, 
-        key=f"pdf_uploader_{st.session_state.uploader_key}"
-    )
-    
-    if st.button("🧹 Limpar Dados para Nova Negociação"):
-        st.session_state.uploader_key += 1
-        st.rerun()
+    try:
+        st.image("logo.png", use_container_width=True)
+    except Exception:
+        pass
 
-    with st.expander("🏭 Tabela de Múltiplos por Fornecedor"):
-        st.caption("Ajuste as embalagens mínimas e tolerâncias:")
-        st.session_state.df_regras = st.data_editor(
-            st.session_state.df_regras, num_rows="dynamic", use_container_width=True, hide_index=True
-        )
+    st.markdown("---")
+    st.header("📂 Nova Compra")
+    uploaded_files = st.file_uploader("Selecione os 4 PDFs das Unidades", type="pdf", accept_multiple_files=True)
+    st.markdown("---")
 
-# ==========================================
-# --- CORPO PRINCIPAL DO PROGRAMA ---
-# ==========================================
-st.title("🎯 Gerenciador de Negociações e Compras em Lote")
-st.caption(f"Distribuição inteligente de volume negociado para {fornecedor_alvo}")
+    with st.expander("⚙️ Configurações Avançadas"):
+        meta = st.number_input("Meta de estoque (meses)", min_value=1, value=2)
+        meses_parado = st.number_input("Considerar estoque parado após (meses)", min_value=1, value=3, step=1)
+        fator_pico = st.number_input("Sensibilidade de Pico (x vezes a média)", min_value=1.5, value=2.5, step=0.5)
+        nome_sugerido = st.text_input("Nome do ficheiro Excel", value="Relatorio_Compras_Tapecaria")
+        nome_final_xlsx = nome_sugerido if nome_sugerido.endswith(".xlsx") else f"{nome_sugerido}.xlsx"
 
+    with st.expander("🏭 Fornecedores e Múltiplos"):
+        st.caption("Edite ou adicione regras na última linha vazia.")
+        df_regras_editado = st.data_editor(st.session_state.df_regras, num_rows="dynamic", use_container_width=True, hide_index=True)
+        st.session_state.df_regras = df_regras_editado
+
+# --- CORPO DO SITE ---
+col1, col2 = st.columns([1, 15])
+with col1:
+    try:
+        st.image("simbolo.png", width=50)
+    except Exception:
+        pass
+with col2:
+    st.title("Inteligência de Compras")
+
+st.markdown("##### Portal Operacional - Tapeçaria")
+st.markdown("<br>", unsafe_allow_html=True)
+
+# ====================================================
+# === PROCESSAMENTO AUTOMÁTICO ("PISCOU, MUDOU") ===
+# ====================================================
 if uploaded_files:
-    dados_totais = []
-    for f in uploaded_files:
-        df_pdf = extrair_dados_pdf(f)
-        if not df_pdf.empty:
-            dados_totais.append(df_pdf)
-            
-    if dados_totais:
-        df_base = pd.concat(dados_totais).reset_index(drop=True)
-        
-        # 1. Filtrar Fornecedor
-        if fornecedor_alvo:
-            df_forn = df_base[df_base['FORNECEDOR'].str.contains(fornecedor_alvo.upper(), na=False)].copy()
-        else:
-            df_forn = df_base.copy()
-            
-        # 2. Filtrar Por Palavra-Chave (Solução 3)
-        if filtro_palavra.strip():
-            df_forn = df_forn[df_forn['DESCRICAO'].str.contains(filtro_palavra.upper().strip(), na=False)].copy()
-            
-        if df_forn.empty:
-            st.warning(f"Nenhum produto encontrado para o fornecedor '{fornecedor_alvo}' com o filtro '{filtro_palavra}'.")
-        else:
-            # Agrupar itens repetidos entre filiais
-            df_agrupado = df_forn.groupby(['CODIGO', 'DESCRICAO', 'FORNECEDOR'], as_index=False).agg({
-                'ESTOQUE': 'sum',
-                'MEDIA_VENDAS': 'sum'
-            })
-            
-            # Apenas itens com venda (Curva A)
-            df_curva_a = df_agrupado[df_agrupado['MEDIA_VENDAS'] > 0].copy()
-            df_curva_a['LABEL_PRODUTO'] = df_curva_a['CODIGO'] + " - " + df_curva_a['DESCRICAO']
-            
-            lista_opcoes = df_curva_a['LABEL_PRODUTO'].tolist()
-            
-            st.markdown("---")
-            st.subheader("📌 Seleção de Produtos Participantes da Negociação (Solução 1)")
-            st.caption("Marque apenas os itens negociados. O volume de 30.000m será distribuído exclusivamente entre eles.")
-            
-            # Controle de seleção (Marcar / Desmarcar Todos)
-            col_b1, col_b2, _ = st.columns([1, 1, 4])
-            if "skus_selecionados" not in st.session_state:
-                st.session_state.skus_selecionados = lista_opcoes
-                
-            if col_b1.button("✅ Selecionar Todos"):
-                st.session_state.skus_selecionados = lista_opcoes
-                st.rerun()
-            if col_b2.button("❌ Desmarcar Todos"):
-                st.session_state.skus_selecionados = []
-                st.rerun()
+    dfs_por_filial = {}
+    todos_dados = []
+    meses_globais = []
 
-            produtos_escolhidos = st.multiselect(
-                "Itens Incluídos no Lote:",
-                options=lista_opcoes,
-                default=[p for p in st.session_state.skus_selecionados if p in lista_opcoes]
-            )
-            
-            df_filtrado_final = df_curva_a[df_curva_a['LABEL_PRODUTO'].isin(produtos_escolhidos)].copy()
-            
-            if df_filtrado_final.empty:
-                st.info("⚠️ Nenhum produto selecionado para a negociação. Selecione pelo menos um item acima.")
-            else:
-                soma_vendas = df_filtrado_final['MEDIA_VENDAS'].sum()
-                
-                # --- RATEIO PROPORCIONAL RE-CALCULADO ---
-                df_filtrado_final['PARTICIPACAO_%'] = (df_filtrado_final['MEDIA_VENDAS'] / soma_vendas)
-                df_filtrado_final['QTD_BRUTA_SUGERIDA'] = df_filtrado_final['PARTICIPACAO_%'] * volume_total
-                
-                # Lotes
-                df_filtrado_final['QTD_LOTE1_BRUTA'] = df_filtrado_final['QTD_BRUTA_SUGERIDA'] * (pct_lote1 / 100.0)
-                df_filtrado_final['QTD_LOTE2_BRUTA'] = df_filtrado_final['QTD_BRUTA_SUGERIDA'] * (pct_lote2 / 100.0)
-                
-                # Múltiplos
-                df_filtrado_final[f'SUGESTAO_{rotulo_lote1.upper()}'] = df_filtrado_final.apply(
-                    lambda r: aplicar_multiplo(r, r['QTD_LOTE1_BRUTA']), axis=1
-                )
-                df_filtrado_final[f'SUGESTAO_{rotulo_lote2.upper()}'] = df_filtrado_final.apply(
-                    lambda r: aplicar_multiplo(r, r['QTD_LOTE2_BRUTA']), axis=1
-                )
-                
-                df_filtrado_final['TOTAL_SUGERIDO'] = (
-                    df_filtrado_final[f'SUGESTAO_{rotulo_lote1.upper()}'] + df_filtrado_final[f'SUGESTAO_{rotulo_lote2.upper()}']
-                )
-                
-                # --- DASHBOARD DE RESULTADOS ---
-                st.markdown("---")
-                st.markdown("### 📊 Resumo da Distribuição do Pedido")
-                m1, m2, m3, m4 = st.columns(4)
-                
-                total_alocado = df_filtrado_final['TOTAL_SUGERIDO'].sum()
-                m1.metric("Meta Negociada", f"{volume_total:,} un.")
-                m2.metric("Total Alocado (Com Múltiplos)", f"{total_alocado:,} un.")
-                m3.metric(f"Lote 1 ({rotulo_lote1})", f"{df_filtrado_final[f'SUGESTAO_{rotulo_lote1.upper()}'].sum():,} un.")
-                m4.metric(f"Lote 2 ({rotulo_lote2})", f"{df_filtrado_final[f'SUGESTAO_{rotulo_lote2.upper()}'].sum():,} un.")
-                
-                st.subheader("📋 Pedido Fechado por Item")
-                cols_exibicao = [
-                    'CODIGO', 'DESCRICAO', 'ESTOQUE', 'MEDIA_VENDAS',
-                    f'SUGESTAO_{rotulo_lote1.upper()}', f'SUGESTAO_{rotulo_lote2.upper()}', 'TOTAL_SUGERIDO'
-                ]
-                
-                st.dataframe(
-                    df_filtrado_final[cols_exibicao].sort_values(by='MEDIA_VENDAS', ascending=False), 
-                    use_container_width=True
-                )
-                
-                excel_bytes = gerar_excel(df_filtrado_final[cols_exibicao], fornecedor_alvo, volume_total)
-                st.download_button(
-                    label="📥 Exportar Negociação para Excel",
-                    data=excel_bytes,
-                    file_name=f"Negociacao_{fornecedor_alvo}_{volume_total}Mts.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True
-                )
+    for f in uploaded_files:
+        df, meses = extrair_dados_pdf_web(f)
+        if not df.empty:
+            dfs_por_filial[f.name.replace(".pdf", "").upper()] = df
+            todos_dados.append(df)
+            if len(meses) >= 4 and not meses_globais:
+                meses_globais = meses[:4]
+
+    if not meses_globais:
+        meses_globais = ["MÊS 1", "MÊS 2", "MÊS 3", "MÊS 4"]
+
+    if not todos_dados:
+        st.error("⚠️ O sistema não encontrou produtos compatíveis nos PDFs.")
     else:
-        st.error("Não foi possível ler dados válidos nos PDFs.")
+        try:
+            df_global = pd.concat(todos_dados).reset_index(drop=True)
+            df_global['ESTOQUE_DISPONIVEL'] = df_global['ESTOQUE']
+
+            vendas_recentes = df_global['MES_1'] + df_global['MES_2'] + df_global['MES_3'] + df_global['MES_4']
+            df_global['TOTAL_VENDAS_RECENTES'] = vendas_recentes
+
+            # Rastreador de excedentes para cálculo de transferências
+            tracker_estoque = {}
+            for _, row in df_global.iterrows():
+                f_nome = row['FILIAL_NOME']
+                c = row['CODIGO']
+                est = float(row['ESTOQUE'])
+                med = float(row['MEDIA_SISTEMA'])
+                excesso = est if med == 0 else max(0.0, est - (med * meta))
+                tracker_estoque[(f_nome, c)] = {'EXCEDENTE': excesso, 'MEDIA': med, 'ESTOQUE_FINAL': est}
+
+            # Lógica de Sugestão de Compras e Transferências
+            resultados = []
+            dash_qtd_comprar = 0
+            dash_qtd_transferida = 0
+            dash_itens_pico = 0
+            dash_itens_ruptura = 0
+
+            # Mapeamento de múltiplos de fornecedor
+            regras_dict = dict(zip(st.session_state.df_regras['FORNECEDOR'].str.upper(), st.session_state.df_regras['MULTIPLO']))
+            multiplo_padrao = regras_dict.get('GERAL', 1)
+
+            for _, row in df_global.iterrows():
+                f_nome = row['FILIAL_NOME']
+                c = row['CODIGO']
+                med = float(row['MEDIA_SISTEMA'])
+                est = float(row['ESTOQUE'])
+                res = float(row['RESERVA'])
+                comp = float(row['COMPRADA'])
+                fornecedor = str(row['FORNECEDOR']).upper()
+
+                # Identificação de Picos
+                max_venda = max(row['MES_1'], row['MES_2'], row['MES_3'], row['MES_4'])
+                eh_pico = max_venda > (med * fator_pico) and med > 0
+                if eh_pico:
+                    dash_itens_pico += 1
+
+                # Necessidade bruta
+                necessidade = max(0.0, (med * meta) - (est + comp - res))
+
+                qtd_transf = 0.0
+                origem_transf = ""
+
+                # Tenta buscar transferência de outras filiais com excesso
+                if necessidade > 0:
+                    dash_itens_ruptura += 1
+                    for (outra_filial, cod_item), dados_est in tracker_estoque.items():
+                        if cod_item == c and outra_filial != f_nome and dados_est['EXCEDENTE'] > 0:
+                            qtd_atendida = min(necessidade, dados_est['EXCEDENTE'])
+                            qtd_transf += qtd_atendida
+                            dados_est['EXCEDENTE'] -= qtd_atendida
+                            necessidade -= qtd_atendida
+                            origem_transf = outra_filial
+                            dash_qtd_transferida += qtd_atendida
+                            if necessidade == 0:
+                                break
+
+                # Múltiplo de embalagem/fornecedor
+                mult = regras_dict.get(fornecedor, multiplo_padrao)
+                qtd_comprar = math.ceil(necessidade / mult) * mult if necessidade > 0 else 0
+                dash_qtd_comprar += qtd_comprar
+
+                # Status visual
+                if qtd_comprar > 0:
+                    status = "🔴 RUPTURA / COMPRAR"
+                elif qtd_transf > 0:
+                    status = f"🔵 TRANSFERIR DE {origem_transf}"
+                elif med == 0 and est > 0:
+                    status = "🟡 EXCESSO / SEM GIRO"
+                else:
+                    status = "🟢 OK"
+
+                resultados.append({
+                    'FILIAL': f_nome,
+                    'CODIGO': c,
+                    'DESCRICAO': row['DESCRICAO'],
+                    'FORNECEDOR': fornecedor,
+                    'MEDIA': med,
+                    'ESTOQUE': est,
+                    'COMPRADA': comp,
+                    'SUG_COMPRA': qtd_comprar,
+                    'SUG_TRANSF': qtd_transf,
+                    'ORIGEM_TRANSF': origem_transf,
+                    'STATUS': status,
+                    'MES_1': row['MES_1'],
+                    'MES_2': row['MES_2'],
+                    'MES_3': row['MES_3'],
+                    'MES_4': row['MES_4']
+                })
+
+            df_final = pd.DataFrame(resultados)
+
+            # --- PAINEL DE MÉTRICAS (DASHBOARD) ---
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Unidades a Comprar", f"{dash_qtd_comprar:,.0f}".replace(",", "."))
+            m2.metric("Unidades a Transferir", f"{dash_qtd_transferida:,.0f}".replace(",", "."))
+            m3.metric("Itens em Ruptura", dash_itens_ruptura)
+            m4.metric("Alertas de Pico", dash_itens_pico)
+
+            st.markdown("---")
+
+            # --- TABELA DE VISUALIZAÇÃO NO STREAMLIT ---
+            df_view = df_final[['FILIAL', 'CODIGO', 'DESCRICAO', 'FORNECEDOR', 'MEDIA', 'ESTOQUE', 'COMPRADA', 'SUG_COMPRA', 'SUG_TRANSF', 'STATUS']]
+            st.dataframe(df_view.style.apply(pintar_tabela, axis=1), use_container_width=True)
+
+            # --- GERADOR DE EXCEL (OPENPYXL) ---
+            buffer = BytesIO()
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Plano_de_Compras"
+
+            # Estilos de Excel
+            header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
+            header_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+            border_thin = Border(left=Side(style='thin', color='D9D9D9'),
+                                 right=Side(style='thin', color='D9D9D9'),
+                                 top=Side(style='thin', color='D9D9D9'),
+                                 bottom=Side(style='thin', color='D9D9D9'))
+
+            # Cabeçalhos do Excel
+            colunas = list(df_final.columns)
+            ws.append(colunas)
+            for col_num, col_name in enumerate(colunas, 1):
+                cell = ws.cell(row=1, column=col_num)
+                cell.fill = header_fill
+                cell.font = header_font
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+
+            # Dados
+            for row in df_final.itertuples(index=False):
+                ws.append(list(row))
+
+            # Formatação de bordas e alinhamentos
+            for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=1, max_col=len(colunas)):
+                for cell in row:
+                    cell.border = border_thin
+                    if isinstance(cell.value, (int, float)):
+                        cell.number_format = '#,##0.00'
+
+            # Auto-ajuste de largura das colunas
+            for col in ws.columns:
+                max_len = max(len(str(cell.value or '')) for cell in col)
+                col_letter = get_column_letter(col[0].column)
+                ws.column_dimensions[col_letter].width = max(max_len + 3, 12)
+
+            wb.save(buffer)
+            buffer.seek(0)
+
+            # Botão de Download
+            st.download_button(
+                label="📥 Baixar Relatório em Excel",
+                data=buffer,
+                file_name=nome_final_xlsx,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+
+        except Exception as e:
+            st.error(f"Erro ao processar arquivos: {e}")
+            st.text(traceback.format_exc())
+
 else:
-    st.info("👈 Utilize a barra lateral para definir os parâmetros e carregar os PDFs.")
+    st.info("A aguardar documentos. Por favor, carregue os ficheiros PDF na barra lateral para iniciar.")
